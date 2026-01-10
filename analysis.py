@@ -1,9 +1,16 @@
-
-# analysis.py
 import numpy as np
 import pandas as pd
 from scipy.spatial import distance
 import config
+import scipy.stats as stats
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # Silence TF
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
 class Analyzer:
     @staticmethod
@@ -210,17 +217,25 @@ class Analyzer:
         }
         
     @staticmethod
-    def backtest_nn(swings_df, k=5, min_history=10):
+    def backtest(swings_df, method='NN', k=5, window=10, min_history=30):
+        """
+        Generic backtest for different models (NN, XGBoost, LSTM).
+        """
         if len(swings_df) < min_history + 1:
             return pd.DataFrame()
-            
+
         predictions = []
-        # Walk forward backtest
         for i in range(min_history, len(swings_df)):
             current_history = swings_df.iloc[:i]
-            # Try to predict the next swing (which is swings_df.iloc[i])
-            pred = Analyzer.predict_next_swing_nn(current_history, k=k)
             
+            pred = None
+            if method == 'NN':
+                pred = Analyzer.predict_next_swing_nn(current_history, k=k)
+            elif method == 'XGBoost':
+                pred = Analyzer.predict_next_swing_xgboost(current_history, window=window)
+            elif method == 'LSTM':
+                pred = Analyzer.predict_next_swing_lstm(current_history, window=window)
+                
             if pred:
                 actual = swings_df.iloc[i]
                 pred['actual_end_price'] = actual['end_price']
@@ -350,6 +365,156 @@ class Analyzer:
                 })
         
         return pd.DataFrame(springboards)
+
+    @staticmethod
+    def verify_performance(backtest_results):
+        """
+        Programmatically scores the performance of the model using backtest results.
+        Calculates MAPE (Mean Absolute Percentage Error) for Price, Range, and Duration.
+        """
+        if backtest_results.empty:
+            return {}
+
+        results = {}
+        
+        # Helper for MAPE
+        def calculate_mape(actual, predicted):
+            mask = actual != 0
+            if not any(mask): return 1.0 # 100% error if all actuals are 0
+            return (abs(actual[mask] - predicted[mask]) / abs(actual[mask])).mean()
+
+        # 1. Price Accuracy
+        results['price_mape'] = calculate_mape(backtest_results['actual_end_price'], backtest_results['target_price'])
+        
+        # 2. Range Accuracy
+        results['range_mape'] = calculate_mape(backtest_results['actual_range'], backtest_results['predicted_range'])
+        
+        # 3. Duration Accuracy
+        results['duration_mape'] = calculate_mape(backtest_results['actual_duration'], backtest_results['predicted_duration'])
+        
+        # 4. Success Direction Rate
+        total = len(backtest_results)
+        correct_dir = (backtest_results['direction'] == backtest_results['actual_direction']).sum()
+        results['direction_accuracy'] = correct_dir / total if total > 0 else 0
+        
+        return results
+
+    @staticmethod
+    def prepare_ml_features(swings_df, window=10):
+        """
+        Prepares a feature matrix (X) and targets (y) for ML models.
+        Features include lags of range, duration, volume, and intensity.
+        """
+        if len(swings_df) < window + 1:
+            return None, None
+
+        features = []
+        targets = []
+        
+        # We look at 'window' previous swings (of alternating directions)
+        for i in range(window, len(swings_df)):
+            subset = swings_df.iloc[i-window:i]
+            target = swings_df.iloc[i]
+            
+            # Feature vector: range, duration, volume, intensity for each swing in window
+            # Also include direction as a binary feature (1 for Up, 0 for Down)
+            row = []
+            for _, s in subset.iterrows():
+                row.extend([
+                    1 if s['direction'] == 'Up' else 0,
+                    s['range'],
+                    s['duration_mins'],
+                    s['volume'],
+                    s['intensity']
+                ])
+            
+            features.append(row)
+            # Targets: range and duration_mins (we'll predict these)
+            targets.append([target['range'], target['duration_mins']])
+            
+        return np.array(features), np.array(targets)
+
+    @staticmethod
+    def predict_next_swing_xgboost(swings_df, window=10):
+        """
+        Predicts next swing using XGBoost.
+        """
+        X, y = Analyzer.prepare_ml_features(swings_df, window=window)
+        if X is None or len(X) < 20: # Need some training data
+            return None
+
+        # Features for the prediction (the latest window)
+        latest_X = X[-1].reshape(1, -1)
+        
+        # Training a simple model on the fly (for demonstration, usually pre-trained is better)
+        # We'll predict range first
+        model_range = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1)
+        model_range.fit(X[:-1], y[:-1, 0])
+        pred_range = model_range.predict(latest_X)[0]
+        
+        # Predict duration
+        model_dur = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1)
+        model_dur.fit(X[:-1], y[:-1, 1])
+        pred_dur = model_dur.predict(latest_X)[0]
+        
+        last_swing = swings_df.iloc[-1]
+        next_dir = 'Down' if last_swing['direction'] == 'Up' else 'Up'
+        
+        target_price = last_swing['end_price'] + pred_range if next_dir == 'Up' else last_swing['end_price'] - pred_range
+        target_time = pd.Timestamp(last_swing['end_time']) + pd.Timedelta(minutes=float(pred_dur))
+        
+        return {
+            'direction': next_dir,
+            'target_price': target_price,
+            'target_time': target_time,
+            'predicted_range': pred_range,
+            'predicted_duration': pred_dur
+        }
+
+    @staticmethod
+    def predict_next_swing_lstm(swings_df, window=10):
+        """
+        Predicts next swing using a simple LSTM model.
+        """
+        X, y = Analyzer.prepare_ml_features(swings_df, window=window)
+        if X is None or len(X) < 30: # Need more data for LSTM
+            return None
+
+        # Reshape for LSTM: (samples, time_steps, features)
+        # In our case, features per step is 5 (dir, range, dur, vol, intensity)
+        # X is already flattened (window * 5), let's reshape it
+        X_lstm = X.reshape(X.shape[0], window, 5)
+        latest_X = X_lstm[-1].reshape(1, window, 5)
+        
+        # Build a small LSTM model
+        model = Sequential([
+            LSTM(32, input_shape=(window, 5), return_sequences=False),
+            Dropout(0.2),
+            Dense(16, activation='relu'),
+            Dense(2) # Output: range, duration
+        ])
+        
+        model.compile(optimizer='adam', loss='mse')
+        # Train briefly (usually would be pre-trained)
+        model.fit(X_lstm[:-1], y[:-1], epochs=10, batch_size=8, verbose=0)
+        
+        preds = model.predict(latest_X, verbose=0)[0]
+        pred_range = float(preds[0])
+        pred_dur = float(preds[1])
+        
+        last_swing = swings_df.iloc[-1]
+        next_dir = 'Down' if last_swing['direction'] == 'Up' else 'Up'
+        
+        target_price = last_swing['end_price'] + pred_range if next_dir == 'Up' else last_swing['end_price'] - pred_range
+        target_time = pd.Timestamp(last_swing['end_time']) + pd.Timedelta(minutes=float(pred_dur))
+        
+        return {
+            'direction': next_dir,
+            'target_price': target_price,
+            'target_time': target_time,
+            'predicted_range': pred_range,
+            'predicted_duration': pred_dur
+        }
 
     @staticmethod
     def detect_smt_divergence(df1, df2, length=5):
