@@ -282,6 +282,76 @@ class Analyzer:
         return pd.DataFrame(sot_signals)
 
     @staticmethod
+    def detect_hinge(swings_df, window=4):
+        """
+        Detects 'Hinge' or 'Apex' (Dullness).
+        Occurs when volatility (range) and volume/intensity are shrinking.
+        Indicates the market is coiling before a 'Springboard' move.
+        """
+        if len(swings_df) < window:
+            return pd.DataFrame()
+
+        hinge_signals = []
+        
+        # Check the last 'window' swings
+        for i in range(window - 1, len(swings_df)):
+            subset = swings_df.iloc[i-(window-1) : i+1]
+            
+            # 1. Check if ranges are generally decreasing
+            ranges = subset['range'].values
+            is_range_shrinking = all(ranges[j] < ranges[j-1] * 1.1 for j in range(1, len(ranges))) # Soft decrease
+            
+            # 2. Check if absolute range is small compared to recent average
+            avg_range = swings_df['range'].rolling(20).mean().iloc[i]
+            is_tight = subset['range'].iloc[-1] < avg_range * 0.5
+            
+            # 3. Check for declining volume or intensity
+            intensities = subset['intensity'].values
+            is_dull = intensities[-1] < intensities[0]
+            
+            if is_range_shrinking and is_tight and is_dull:
+                hinge_signals.append({
+                    'time': subset['end_time'].iloc[-1],
+                    'price': subset['end_price'].iloc[-1],
+                    'type': 'Hinge',
+                    'avg_range_at_time': avg_range,
+                    'current_range': subset['range'].iloc[-1]
+                })
+                
+        return pd.DataFrame(hinge_signals)
+
+    @staticmethod
+    def detect_springboard(swings_df, hinge_df):
+        """
+        Detects 'Springboard' - an intentional breakout from a Hinge/Apex.
+        A springboard is a fast, aggressive swing that breaks the range of a recent Hinge.
+        """
+        if hinge_df.empty or swings_df.empty:
+            return pd.DataFrame()
+
+        # Get the latest hinge
+        latest_hinge = hinge_df.iloc[-1]
+        
+        # Look for the next swing after the hinge
+        breakout_swings = swings_df[swings_df['start_time'] >= latest_hinge['time']]
+        
+        if breakout_swings.empty:
+            return pd.DataFrame()
+            
+        springboards = []
+        for _, swing in breakout_swings.iterrows():
+            # Logic: If swing velocity and intensity are high compared to the hinge
+            if swing['velocity'] > (latest_hinge['current_range'] / 1.0) and swing['intensity'] > 0:
+                springboards.append({
+                    'time': swing['end_time'],
+                    'direction': swing['direction'],
+                    'type': 'Springboard',
+                    'price': swing['end_price']
+                })
+        
+        return pd.DataFrame(springboards)
+
+    @staticmethod
     def detect_smt_divergence(df1, df2, length=5):
         merged = pd.merge(df1, df2, on='time', suffixes=('_1', '_2'), how='inner')
         window = 2 * length + 1
