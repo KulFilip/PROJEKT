@@ -1,0 +1,12 @@
+plotly
+numpy
+pandas
+MetaTrader5
+pytz
+openpyxl
+scipy
+matplotlib
+jupyter
+ipykernel
+nbformat
+SQLAlchemy
