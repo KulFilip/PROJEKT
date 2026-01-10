@@ -84,3 +84,29 @@ class DatabaseManager:
             return df.sort_values('time').reset_index(drop=True)
         except:
             return pd.DataFrame()
+
+    def save_performance_metrics(self, model_name, symbol, scores):
+        """
+        Saves model performance metrics for comparison.
+        """
+        data = {
+            'timestamp': [pd.Timestamp.now()],
+            'model_name': [model_name],
+            'symbol': [symbol],
+            'direction_accuracy': [scores.get('direction_accuracy')],
+            'price_mape': [scores.get('price_mape')],
+            'range_mape': [scores.get('range_mape')],
+            'duration_mape': [scores.get('duration_mape')]
+        }
+        df = pd.DataFrame(data)
+        df.to_sql('backtest_performance', self.engine, if_exists='append', index=False)
+        print(f"Logged performance for {model_name} to database.")
+
+    def load_performance_comparison(self):
+        """
+        Loads all saved performance metrics for comparison.
+        """
+        try:
+            return pd.read_sql("SELECT * FROM backtest_performance ORDER BY timestamp DESC", self.engine)
+        except:
+            return pd.DataFrame()

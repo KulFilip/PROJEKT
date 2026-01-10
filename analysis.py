@@ -429,8 +429,8 @@ class Analyzer:
                 ])
             
             features.append(row)
-            # Targets: range and duration_mins (we'll predict these)
-            targets.append([target['range'], target['duration_mins']])
+            # Targets: range, duration_mins, and absolute end_price
+            targets.append([target['range'], target['duration_mins'], target['end_price']])
             
         return np.array(features), np.array(targets)
 
@@ -456,19 +456,24 @@ class Analyzer:
         model_dur = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1)
         model_dur.fit(X[:-1], y[:-1, 1])
         pred_dur = model_dur.predict(latest_X)[0]
+
+        # Predict absolute price independently
+        model_price = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1)
+        model_price.fit(X[:-1], y[:-1, 2])
+        pred_price = model_price.predict(latest_X)[0]
         
         last_swing = swings_df.iloc[-1]
         next_dir = 'Down' if last_swing['direction'] == 'Up' else 'Up'
         
-        target_price = last_swing['end_price'] + pred_range if next_dir == 'Up' else last_swing['end_price'] - pred_range
+        # We now have an independently predicted target_price
         target_time = pd.Timestamp(last_swing['end_time']) + pd.Timedelta(minutes=float(pred_dur))
         
         return {
             'direction': next_dir,
-            'target_price': target_price,
+            'target_price': float(pred_price),
             'target_time': target_time,
-            'predicted_range': pred_range,
-            'predicted_duration': pred_dur
+            'predicted_range': float(pred_range),
+            'predicted_duration': float(pred_dur)
         }
 
     @staticmethod
@@ -495,26 +500,66 @@ class Analyzer:
         ])
         
         model.compile(optimizer='adam', loss='mse')
-        # Train briefly (usually would be pre-trained)
-        model.fit(X_lstm[:-1], y[:-1], epochs=10, batch_size=8, verbose=0)
+        # Train briefly
+        model.fit(X_lstm[:-1], y[:-1, :2], epochs=10, batch_size=8, verbose=0) # Original range/dur
         
+        # We'll add a second head or just a separate model for price to keep it simple
+        model_p = Sequential([
+            LSTM(32, input_shape=(window, 5), return_sequences=False),
+            Dense(1), # Output: price
+        ])
+        model_p.compile(optimizer='adam', loss='mse')
+        model_p.fit(X_lstm[:-1], y[:-1, 2], epochs=10, batch_size=8, verbose=0)
+
         preds = model.predict(latest_X, verbose=0)[0]
         pred_range = float(preds[0])
         pred_dur = float(preds[1])
+        preds_p = model_p.predict(latest_X, verbose=0)[0]
+        pred_price = float(preds_p[0])
         
         last_swing = swings_df.iloc[-1]
         next_dir = 'Down' if last_swing['direction'] == 'Up' else 'Up'
         
-        target_price = last_swing['end_price'] + pred_range if next_dir == 'Up' else last_swing['end_price'] - pred_range
         target_time = pd.Timestamp(last_swing['end_time']) + pd.Timedelta(minutes=float(pred_dur))
         
         return {
             'direction': next_dir,
-            'target_price': target_price,
+            'target_price': pred_price,
             'target_time': target_time,
             'predicted_range': pred_range,
             'predicted_duration': pred_dur
         }
+
+    @staticmethod
+    def save_backtest_report(backtest_results, scores, model_name, db_manager=None, symbol='Unknown'):
+        """
+        Saves the backtest results and performance scores to the reports/ directory and database.
+        """
+        import datetime
+        if not os.path.exists('reports'):
+            os.makedirs('reports')
+            
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_file = f"reports/report_{model_name}_{timestamp}.csv"
+        summary_file = f"reports/summary_{model_name}_{timestamp}.md"
+        
+        # Save results to CSV
+        backtest_results.to_csv(report_file, index=False)
+        
+        # Save summary to Markdown
+        with open(summary_file, 'w') as f:
+            f.write(f"# Midas Backtest Summary: {model_name}\n")
+            f.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("## Performance Scores\n")
+            for k, v in scores.items():
+                f.write(f"- **{k.replace('_', ' ').title()}**: {v*100:.2f}%\n" if 'mape' in k or 'accuracy' in k else f"- **{k}**: {v}\n")
+            f.write(f"\nCSV Report: {report_file}\n")
+            
+        # Log to Database
+        if db_manager:
+            db_manager.save_performance_metrics(model_name, symbol, scores)
+            
+        return report_file, summary_file
 
     @staticmethod
     def detect_smt_divergence(df1, df2, length=5):
