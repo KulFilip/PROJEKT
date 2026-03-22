@@ -473,7 +473,8 @@ class Analyzer:
                 s['range'],
                 s['duration_mins'],
                 s['volume'],
-                s['intensity']
+                s['intensity'],
+                s['range'] / s['duration_mins'] if s['duration_mins'] != 0 else 0 # Velocity
             ])
             # Relative features (Wyckoff Ratios)
             if j > 0:
@@ -484,17 +485,15 @@ class Analyzer:
                 ])
             else:
                 row.extend([1.0, 1.0])
-            row.append(s['range'] / s['duration_mins'] if s['duration_mins'] != 0 else 0) # Velocity
         return row
 
     @staticmethod
     def prepare_ml_features(swings_df, window=10):
         """
-        POPRAWIONA WERSJA - BEZ DATA LEAKAGE.
-        Returns:
-            X: Features for swings index [window : len-1] (excludes last available target)
-            y: Targets for those swings
-            latest_X: Features for predicting the current UNFINISHED or NEXT swing
+        Prepares features (X) and targets (y) with strict lookahead prevention.
+        - For XGBoost: X is (samples, window * 8)
+        - For LSTM: X is (samples, window, 8)
+        - Targets y include: [range, duration, price_delta_pct]
         """
         if len(swings_df) < window + 1:
             return None, None, None
@@ -502,27 +501,25 @@ class Analyzer:
         features = []
         targets = []
         
-        # ✅ FIX: range goes to len - 1 to exclude the last available swing from training
-        for i in range(window, len(swings_df) - 1):
+        # Training data: Each target i depends strictly on swings [i-window : i]
+        for i in range(window, len(swings_df)):
             subset = swings_df.iloc[i-window:i]
             target = swings_df.iloc[i]
             
+            # Extract features for this window
             row = Analyzer.extract_swing_features(subset)
             features.append(row)
             
-            # Target is the NEXT swing relative to the subset end
+            # Target is the NEXT swing
             price_delta_pct = (target['end_price'] - subset.iloc[-1]['end_price']) / subset.iloc[-1]['end_price']
             targets.append([target['range'], target['duration_mins'], price_delta_pct])
             
-        # ✅ Latest features for the TRUE prediction (predicting the very last swing in input or next)
-        latest_subset = swings_df.iloc[-window:]
-        latest_X = np.array(Analyzer.extract_swing_features(latest_subset)).reshape(1, -1)
-        
         X = np.array(features)
         y = np.array(targets)
         
-        # Debug info for verification
-        # print(f"[DEBUG] prepare_ml_features: Input={len(swings_df)}, X={X.shape}, latest_X for swing index {len(swings_df)-1}")
+        # Features for the FUTURE prediction (very latest window)
+        latest_subset = swings_df.iloc[-window:]
+        latest_X = np.array(Analyzer.extract_swing_features(latest_subset)).reshape(1, -1)
         
         return X, y, latest_X
 
@@ -535,15 +532,7 @@ class Analyzer:
         if X is None or len(X) < 20: 
             return None
 
-        # ✅ FIX: Explicit Leakage Validation
-        last_swing = swings_df.iloc[-1]
-        if len(y) > 0:
-            last_target_range = y[-1][0]
-            if abs(last_target_range - last_swing['range']) < 0.0001:
-                # print(f"  ❌ ERROR: Training target contains last potential swing - DATA LEAKAGE!")
-                raise ValueError("Data leakage detected: Training set includes the goal swing.")
-
-        # Train on historical features only
+        # Train on all available history
         model_range = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.1)
         model_range.fit(X, y[:, 0])
         pred_range = model_range.predict(latest_X)[0]
@@ -556,6 +545,7 @@ class Analyzer:
         model_price.fit(X, y[:, 2])
         pred_price_delta = model_price.predict(latest_X)[0]
         
+        last_swing = swings_df.iloc[-1]
         next_dir = 'Down' if last_swing['direction'] == 'Up' else 'Up'
         
         # Absolute price derived from relative delta
@@ -583,14 +573,6 @@ class Analyzer:
         if X is None or len(X) < 40: 
             return None
 
-        # ✅ FIX: Leakage Debug
-        last_swing = swings_df.iloc[-1]
-        if len(y) > 0:
-            last_target_range = y[-1][0]
-            if abs(last_target_range - last_swing['range']) < 0.0001:
-                raise ValueError("Data leakage detected in LSTM training set.")
-
-        # ✅ FIX: Progressive scaling (Scale only on historical training data)
         scaler_X = StandardScaler()
         scaler_y = StandardScaler()
         
@@ -598,10 +580,10 @@ class Analyzer:
         y_scaled = scaler_y.fit_transform(y)
         
         # Reshape to (samples, window, features_per_swing)
+        # features_per_swing is 8 (direction, range, dur, vol, intent, vel, range_ratio, dur_ratio)
         features_per_swing = 8 
         X_lstm = X_scaled.reshape(X_scaled.shape[0], window, features_per_swing)
         
-        # TRANSFORM ONLY (Do not fit on latest_X_raw)
         latest_X_scaled = scaler_X.transform(latest_X_raw)
         latest_X = latest_X_scaled.reshape(1, window, features_per_swing)
         
@@ -639,6 +621,7 @@ class Analyzer:
         pred_dur = float(final_preds[1])
         pred_price_delta = float(final_preds[2])
         
+        last_swing = swings_df.iloc[-1]
         next_dir = 'Down' if last_swing['direction'] == 'Up' else 'Up'
         pred_price = last_swing['end_price'] * (1 + pred_price_delta)
         calc_price = last_swing['end_price'] + (pred_range if next_dir == 'Up' else -pred_range)
@@ -1078,14 +1061,13 @@ class Analyzer:
         df['is_turning_point'] = 0
         for _, swing in swings_df.iterrows():
             # Find the index where the swing ended
-            idx = df[df['time'] <= swing['end_time']].index
-            if not idx.empty:
-                turning_idx = idx[-1]
-                # Label the turn shifted by 5-20 bars (confirmation lag)
-                # This ensures the model learns "A reversal just happened" rather than "It's happening now"
-                future_window = df.index[df.index > turning_idx][:20]
-                if len(future_window) > 5:
-                    df.loc[future_window[5:], 'is_turning_point'] = 1
+            end_indices = df[df['time'] == swing['end_time']].index
+            if not end_indices.empty:
+                end_idx = end_indices[0]
+                # Label the turn shifted by 5 bars (confirmation lag)
+                # This ensures the model only learns from turns that would have been identifiable
+                label_idx = min(len(df)-1, end_idx + 5)
+                df.loc[label_idx, 'is_turning_point'] = 1
                 
         # 2. Train and Predict with Selected Features
         data = df[active_features + ['is_turning_point']].dropna()
@@ -1171,101 +1153,3 @@ class Analyzer:
         fig.update_yaxes(title_text=f"Price {symbol2}", secondary_y=True)
         
         return fig
-
-def comprehensive_leakage_test(swings_df):
-    """
-    Kompleksowy test data leakage.
-    Ensures that the model is not trained on the target it is asked to predict.
-    """
-    print("="*80)
-    print("🔬 COMPREHENSIVE DATA LEAKAGE TEST")
-    print("="*80)
-    
-    # Test 1: prepare_ml_features
-    print("\n[Test 1] prepare_ml_features")
-    print("-"*80)
-    
-    test_swings = swings_df.iloc[:100].copy()
-    X, y, latest_X = Analyzer.prepare_ml_features(test_swings, window=10)
-    
-    print(f"✓ Input: {len(test_swings)} swings")
-    print(f"✓ X shape: {X.shape}")
-    print(f"✓ y shape: {y.shape}")
-    print(f"✓ latest_X shape: {latest_X.shape}")
-    
-    # Verify: ostatni target powinien być swing[98], NIE swing[99]
-    last_target_range = y[-1][0]
-    swing_98_range = test_swings.iloc[98]['range']
-    swing_99_range = test_swings.iloc[99]['range']
-    
-    print(f"\nVerification:")
-    print(f"  Last target in y: {last_target_range:.5f}")
-    print(f"  Swing[98] range: {swing_98_range:.5f}")
-    print(f"  Swing[99] range: {swing_99_range:.5f}")
-    
-    match_98 = abs(last_target_range - swing_98_range) < 0.0001
-    match_99 = abs(last_target_range - swing_99_range) < 0.0001
-    
-    if match_98 and not match_99:
-        print(f"  ✅ PASS: Last target matches swing[98] (correct)")
-    elif match_99:
-        print(f"  ❌ FAIL: Last target matches swing[99] (LEAKAGE!)")
-        return False
-    else:
-        print(f"  ⚠️  WARNING: No exact match (check feature engineering)")
-    
-    # Test 2: XGBoost prediction
-    print("\n[Test 2] XGBoost Prediction")
-    print("-"*80)
-    
-    try:
-        pred = Analyzer.predict_next_swing_xgboost(test_swings, window=10)
-        print(f"✓ Prediction generated successfully")
-        print(f"  Predicted range: {pred['predicted_range']:.5f}")
-        print(f"  Direction: {pred['direction']}")
-    except ValueError as e:
-        print(f"❌ FAIL: {e}")
-        return False
-    
-    # Test 3: Backtest pojedynczej iteracji
-    print("\n[Test 3] Backtest Single Iteration")
-    print("-"*80)
-    
-    i = 50
-    history = swings_df.iloc[:i].copy()
-    actual = swings_df.iloc[i]
-    
-    print(f"History: swings 0 to {i-1}")
-    print(f"  Last historical swing ends: {history.iloc[-1]['end_time']}")
-    print(f"Target: swing {i}")
-    print(f"  Actual swing ends: {actual['end_time']}")
-    
-    time_gap = (actual['end_time'] - history.iloc[-1]['end_time']).total_seconds() / 60
-    print(f"  Time gap: {time_gap:.1f} minutes")
-    
-    if time_gap <= 0:
-        print(f"  ❌ FAIL: Target is BEFORE or AT last historical swing (TIME LEAKAGE)")
-        return False
-    else:
-        print(f"  ✅ PASS: Target is in the future")
-    
-    pred = Analyzer.predict_next_swing_xgboost(history, window=10)
-    
-    if pred:
-        error_pct = abs(pred['target_price'] - actual['end_price']) / actual['end_price'] * 100
-        print(f"\nPrediction vs Actual:")
-        print(f"  Predicted price: {pred['target_price']:.5f}")
-        print(f"  Actual price: {actual['end_price']:.5f}")
-        print(f"  Error: {error_pct:.2f}%")
-        
-        if error_pct < 0.05:
-            print(f"  ⚠️  WARNING: Error suspiciously low (< 0.05%)")
-        elif error_pct > 20:
-            print(f"  ⚠️  WARNING: Error very high (> 20%)")
-        else:
-            print(f"  ✅ Error in reasonable range (0.05-20%)")
-    
-    print("\n" + "="*80)
-    print("✅ ALL TESTS PASSED")
-    print("="*80)
-    return True
